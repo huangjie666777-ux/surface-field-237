@@ -1,0 +1,9 @@
+build/
+bin/
+*.o
+*.a
+*.so
+*.out
+.env
+*.key
+*.pem
