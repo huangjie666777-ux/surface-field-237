@@ -17,7 +17,8 @@ bool tri_degenerate(const Vec3& a, const Vec3& b, const Vec3& c) {
   const double l1 = (c - b).norm();
   const double l2 = (a - c).norm();
   const double longest = std::max({l0, l1, l2});
-  const double tol = kDegenerateEps * std::max(1.0, longest * longest);
+  // 相对容差：按最长边平方缩放，避免误拒边长极小（如 1e-7）的有效三角形。
+  const double tol = kDegenerateEps * longest * longest;
   return tri_double_area(a, b, c) <= tol;
 }
 
@@ -78,4 +79,3 @@ std::vector<std::uint32_t> MeshState::opposite_vertices(std::uint32_t a,
 }
 
 }  // namespace surface_field237::internal
-

@@ -45,11 +45,16 @@ SimplifyResult simplify(const std::vector<Vec3>& vertices,
   const internal::SimplifyOutcome outcome =
       internal::run_simplification(st, target_face_count);
 
-  // 紧凑输出：重映射活顶点与三角索引。
+  // 紧凑输出：仅保留被存活面引用的顶点，重映射三角索引。
+  std::vector<bool> referenced(st.pos.size(), false);
+  for (const auto& f : st.faces) {
+    if (!f.alive) continue;
+    for (int k = 0; k < 3; ++k) referenced[f.v[k]] = true;
+  }
   std::unordered_map<std::uint32_t, std::uint32_t> remap;
   remap.reserve(st.pos.size());
   for (std::uint32_t i = 0; i < st.pos.size(); ++i) {
-    if (!st.v_alive[i]) continue;
+    if (!st.v_alive[i] || !referenced[i]) continue;
     remap[i] = static_cast<std::uint32_t>(result.vertices.size());
     result.vertices.push_back(st.pos[i]);
   }
