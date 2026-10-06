@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "surface_field237/mesh_lod.h"
+#include "surface_field237/surface_field.h"
 
 using surface_field237::StopReason;
 using surface_field237::Tri;
@@ -218,6 +219,156 @@ int main() {
     }
     expect(!cross && r.actual_face_count <= 40,
            "components not connected, target reached");
+  }
+
+  // 边长 1e-7 的有效三角形不得被面积下限误拒
+  {
+    const double s = 1e-7;
+    std::vector<Vec3> v{{0, 0, 0}, {s, 0, 0}, {0, s, 0}};
+    std::vector<Tri> t{{0, 1, 2}};
+    bool ok = true;
+    try {
+      const auto r = surface_field237::simplify(v, t, 1);
+      ok = r.actual_face_count == 1;
+    } catch (const std::invalid_argument&) {
+      ok = false;
+    }
+    expect(ok, "tiny 1e-7 triangle accepted");
+  }
+  // 减面后不得保留未被引用的顶点
+  {
+    std::vector<Vec3> v;
+    std::vector<Tri> t;
+    make_grid(10, v, t);
+    const auto r = surface_field237::simplify(v, t, 30);
+    std::vector<bool> used(r.vertices.size(), false);
+    for (const Tri& f : r.triangles)
+      for (auto x : f) used[x] = true;
+    bool all_used = true;
+    for (bool u : used)
+      if (!u) all_used = false;
+    expect(all_used, "no unreferenced vertices after simplify");
+  }
+
+  // ---- 表面标量场投射 ----
+  // 单三角形：面内/边/顶点最近点与重心插值
+  {
+    std::vector<Vec3> v{{0, 0, 0}, {1, 0, 0}, {0, 1, 0}};
+    std::vector<Tri> t{{0, 1, 2}};
+    std::vector<double> s{0.0, 10.0, 20.0};
+    const surface_field237::SurfaceFieldQuery q(v, t, s);
+    const std::vector<Vec3> pts{{0.25, 0.25, 1.0},   // 面内上方
+                                {0.5, -0.5, 0.0},    // 边 AB 外侧
+                                {2.0, 2.0, 0.0}};    // 顶点 B/C 之外
+    const auto r = q.project(pts, 10.0);
+    bool ok = r.size() == 3 && r[0].projected && r[1].projected &&
+              r[2].projected;
+    // 面内：最近点 (0.25,0.25,0)，重心 (0.5,0.25,0.25)，标量 7.5
+    ok = ok && std::abs(r[0].closest_point.z()) < 1e-12 &&
+         std::abs(r[0].distance - 1.0) < 1e-12 &&
+         std::abs(r[0].barycentric[0] - 0.5) < 1e-12 &&
+         std::abs(r[0].scalar - 7.5) < 1e-9 && r[0].face_id == 0;
+    // 边：最近点 (0.5,0,0)，标量 5
+    ok = ok && (r[1].closest_point - Vec3(0.5, 0, 0)).norm() < 1e-12 &&
+         std::abs(r[1].scalar - 5.0) < 1e-9;
+    // 顶点区域之外：最近点为边 BC 上某点或顶点，距离有限
+    ok = ok && r[2].distance > 0.0;
+    expect(ok, "exact closest point: face/edge/vertex regions");
+  }
+  // 等距取较小面 ID；边界距离等于上限可接受
+  {
+    // 两个共顶点三角形，查询点在公共边中垂线上等距。
+    std::vector<Vec3> v{{0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, -1, 0}};
+    std::vector<Tri> t{{0, 1, 2}, {1, 0, 3}};
+    std::vector<double> s{0, 1, 2, 3};
+    const surface_field237::SurfaceFieldQuery q(v, t, s);
+    const auto r = q.project({Vec3(0.5, 0.0, 1.0)}, 1.0);
+    expect(r[0].projected && r[0].face_id == 0 &&
+               std::abs(r[0].distance - 1.0) < 1e-12,
+           "tie broken by smaller face id, boundary distance accepted");
+  }
+  // 超限标记未投射，标量非零冒充；非法批次整批拒绝且后续查询正常
+  {
+    std::vector<Vec3> v{{0, 0, 0}, {1, 0, 0}, {0, 1, 0}};
+    std::vector<Tri> t{{0, 1, 2}};
+    std::vector<double> s{1, 2, 3};
+    const surface_field237::SurfaceFieldQuery q(v, t, s);
+    const auto r = q.project({Vec3(0.2, 0.2, 5.0)}, 1.0);
+    bool ok = !r[0].projected && std::isnan(r[0].scalar);
+    // 非法批次：非有限点 / 负距离
+    bool threw = false;
+    try {
+      q.project({Vec3(0, 0, std::nan(""))}, 1.0);
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    bool threw2 = false;
+    try {
+      q.project({Vec3(0, 0, 0)}, -1.0);
+    } catch (const std::invalid_argument&) {
+      threw2 = true;
+    }
+    // 后续查询不受影响
+    const auto r2 = q.project({Vec3(0.2, 0.2, 0.5)}, 1.0);
+    ok = ok && threw && threw2 && r2[0].projected &&
+         std::abs(r2[0].distance - 0.5) < 1e-12;
+    expect(ok, "out-of-range flagged, invalid batch rejected, query reusable");
+  }
+  // 快照独立：构造后修改输入不影响查询
+  {
+    std::vector<Vec3> v{{0, 0, 0}, {1, 0, 0}, {0, 1, 0}};
+    std::vector<Tri> t{{0, 1, 2}};
+    std::vector<double> s{1, 2, 3};
+    const surface_field237::SurfaceFieldQuery q(v, t, s);
+    v[0] = Vec3(100, 100, 100);
+    s[0] = 999.0;
+    t[0] = Tri{2, 1, 0};
+    const auto r = q.project({Vec3(0.0, 0.0, 1.0)}, 2.0);
+    expect(r[0].projected && std::abs(r[0].scalar - 1.0) < 1e-12,
+           "query object holds independent snapshot");
+  }
+  // 标量长度不匹配 / 非有限标量拒绝
+  {
+    std::vector<Vec3> v{{0, 0, 0}, {1, 0, 0}, {0, 1, 0}};
+    std::vector<Tri> t{{0, 1, 2}};
+    bool threw = false;
+    try {
+      surface_field237::SurfaceFieldQuery q(v, t, {1.0, 2.0});
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    bool threw2 = false;
+    try {
+      surface_field237::SurfaceFieldQuery q(v, t, {1.0, 2.0, std::nan("")});
+    } catch (const std::invalid_argument&) {
+      threw2 = true;
+    }
+    expect(threw && threw2, "reject scalar length mismatch / non-finite");
+  }
+  // simplify_with_field：减面顶点投射回原表面，未投射顶点保留并标记
+  {
+    std::vector<Vec3> v;
+    std::vector<Tri> t;
+    make_grid(10, v, t);
+    std::vector<double> s(v.size());
+    for (std::size_t i = 0; i < v.size(); ++i)
+      s[i] = v[i].x() + 2.0 * v[i].y();
+    const auto r =
+        surface_field237::simplify_with_field(v, t, s, 50, 5.0);
+    bool ok = r.projections.size() == r.mesh.vertices.size() &&
+              r.mesh.actual_face_count <= 50;
+    for (const auto& p : r.projections)
+      ok = ok && p.projected && p.distance <= 5.0;
+    // 输入未被修改
+    ok = ok && v.size() == 100;
+    // 极小的 max_distance：部分顶点可能未投射，须明确标记且仍保留
+    const auto r2 = surface_field237::simplify_with_field(v, t, s, 50, 0.0);
+    ok = ok && r2.projections.size() == r2.mesh.vertices.size();
+    bool any_flag = false;
+    for (const auto& p : r2.projections)
+      if (!p.projected) any_flag = true;
+    ok = ok && any_flag;
+    expect(ok, "simplify_with_field projects output vertices, flags misses");
   }
 
   std::cout << (g_failures == 0 ? "ALL TESTS PASSED\n" : "TESTS FAILED\n");
